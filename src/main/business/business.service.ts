@@ -68,40 +68,55 @@ export class BusinessService {
     }
   }
 
-  async findByUser(userId: string) {
-    let connection: PoolConnection | null = null;
-    try {
-      connection = await this.pool.getConnection();
-
-      // Verificar que el usuario existe
-      const [userRows]: [any[], any] = await connection.query(
-        'SELECT id FROM users WHERE id = ?',
-        [userId],
-      );
-
-      if (!userRows || userRows.length === 0) {
-        throw new HttpException(
-          'El usuario especificado no existe',
-          HttpStatus.BAD_REQUEST,
-        );
-      }
-
-      // Obtener todos los negocios del usuario
-      const [businesses] = await connection.query(
-        'SELECT * FROM negocios WHERE propietario = ?',
-        [userId],
-      );
-
-      return businesses;
-    } catch (error) {
+async findByUser(userId: string) {
+  let connection: PoolConnection | null = null;
+  try {
+    connection = await this.pool.getConnection();
+    
+    // Verificar que el usuario existe
+    const [userRows]: [any[], any] = await connection.query(
+      'SELECT id FROM users WHERE id = ?',
+      [userId],
+    );
+    
+    if (!userRows || userRows.length === 0) {
       throw new HttpException(
-        error.message || 'Error al obtener los negocios del usuario',
-        error.status || HttpStatus.INTERNAL_SERVER_ERROR,
+        'El usuario especificado no existe',
+        HttpStatus.BAD_REQUEST,
       );
-    } finally {
-      if (connection) connection.release();
     }
+    
+    // Obtener todos los negocios del usuario con nombres de departamento y municipio
+    const [businesses] = await connection.query(
+      `SELECT 
+        n.id,
+        n.nombre,
+        n.nit,
+        n.direccion,
+        n.telefono,
+        n.email,
+        n.fecha_creacion,
+        n.propietario,
+        n.created_at,
+        d.departamento as departamento,
+        m.municipio as municipio
+      FROM negocios n
+      LEFT JOIN departamentos d ON n.departamento = d.id_departamento
+      LEFT JOIN municipios m ON n.municipio = m.id_municipio
+      WHERE n.propietario = ?`,
+      [userId],
+    );
+    
+    return businesses;
+  } catch (error) {
+    throw new HttpException(
+      error.message || 'Error al obtener los negocios del usuario',
+      error.status || HttpStatus.INTERNAL_SERVER_ERROR,
+    );
+  } finally {
+    if (connection) connection.release();
   }
+}
 
   async deleteBusiness(businessId: number, userId: string) {
     let connection: PoolConnection | null = null;

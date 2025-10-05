@@ -2,14 +2,14 @@ import { HttpException, HttpStatus, Inject, Injectable } from '@nestjs/common';
 import { Pool } from 'mysql2/promise';
 
 @Injectable()
-export abstract class BaseService {
+export class BaseService {
   constructor(
     @Inject('MYSQL') protected pool: Pool,
     @Inject('MYSQL_CLIENTS') protected poolClient: Pool,
   ) {}
 
-  // Método para ejecutar queries SELECT
-  protected async executeQuery<T = any>(
+  // Método público para ejecutar queries que devuelven filas
+  public async executeQuery<T = any>(
     query: string,
     params: any[] = [],
   ): Promise<T[]> {
@@ -22,6 +22,14 @@ export abstract class BaseService {
 
       return rows as T[];
     } catch (error) {
+      // ✅ PRESERVAR ERRORES DE DUPLICACIÓN
+      if (error.message && error.message.includes('Duplicate entry')) {
+        throw new HttpException(
+          `Error en la consulta: ${error.message}`,
+          HttpStatus.CONFLICT, // Cambiar a 409 para errores de duplicación
+        );
+      }
+
       throw new HttpException(
         `Error en la consulta: ${error.message}`,
         HttpStatus.INTERNAL_SERVER_ERROR,
@@ -29,8 +37,8 @@ export abstract class BaseService {
     }
   }
 
-  // Método para queries que no devuelven filas (INSERT, UPDATE, DELETE)
-  protected async executeNonSelectQuery(
+  // Método público para queries que no devuelven filas (INSERT, UPDATE, DELETE)
+  public async executeNonSelectQuery(
     query: string,
     params: any[] = [],
   ): Promise<any> {
@@ -38,6 +46,14 @@ export abstract class BaseService {
       const [result] = await this.pool.query(query, params);
       return result;
     } catch (error) {
+      // ✅ PRESERVAR ERRORES DE DUPLICACIÓN
+      if (error.message && error.message.includes('Duplicate entry')) {
+        throw new HttpException(
+          `Error en la consulta: ${error.message}`,
+          HttpStatus.CONFLICT, // Cambiar a 409 para errores de duplicación
+        );
+      }
+
       throw new HttpException(
         `Error en la consulta: ${error.message}`,
         HttpStatus.INTERNAL_SERVER_ERROR,
@@ -45,10 +61,10 @@ export abstract class BaseService {
     }
   }
 
-  // Método para verificar permisos del negocio
-  protected async verifyBusinessAccess(
+  // Método público para verificar permisos del negocio
+  public async verifyBusinessAccess(
     businessId: number,
-    userId: number,
+    userId: string,
   ): Promise<void> {
     try {
       const [businessRows] = await this.pool.query(
@@ -71,5 +87,15 @@ export abstract class BaseService {
         HttpStatus.INTERNAL_SERVER_ERROR,
       );
     }
+  }
+
+  // Método público para obtener el pool de conexiones (si necesitas acceso directo)
+  public getPool(): Pool {
+    return this.pool;
+  }
+
+  // Método público para obtener el pool de clientes (si necesitas acceso directo)
+  public getClientPool(): Pool {
+    return this.poolClient;
   }
 }

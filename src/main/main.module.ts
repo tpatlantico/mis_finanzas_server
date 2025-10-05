@@ -5,6 +5,9 @@ import { TransactionsModule } from './transactions/transactions.module';
 import { UserModule } from './user/user.module';
 import { ProductsModule } from './products/products.module';
 import { FinancialAnalysisModule } from './financial-analysis/financial-analysis.module';
+import { PointSaleModule } from './point-sale/point-sale.module';
+import { ExpenseCategoriesModule } from './expense-categories/expense-categories.module';
+import { FixedCostModule } from './fixed-cost/fixed-cost.module';
 
 @Module({
     imports: [
@@ -13,7 +16,10 @@ import { FinancialAnalysisModule } from './financial-analysis/financial-analysis
         TransactionsModule,
         UserModule,
         ProductsModule,
-        FinancialAnalysisModule
+        FinancialAnalysisModule,
+        PointSaleModule,
+        ExpenseCategoriesModule,
+        FixedCostModule
     ],
     exports: [
         AnalyticsModule,

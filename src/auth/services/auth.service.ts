@@ -30,6 +30,9 @@ export class AuthService {
 
   async login(user: any, request?: any) {
     let connection: PoolConnection | null = null;
+    console.log("este es el log");
+    console.log(user);
+    
     try {
       connection = await this.pool.getConnection();
   
@@ -77,6 +80,11 @@ export class AuthService {
           id: user.id,
           email: user.email,
           role: user.role,
+          nombres: user.nombres,
+          apellidos:user.apellidos,
+          telefono:user.telefono,
+          documento:user.documento,
+          fecha_nacimiento:user.fecha_nacimiento
         },
       };
     } catch (error) {
