@@ -1,31 +1,24 @@
-import { HttpException, HttpStatus, Inject, Injectable } from '@nestjs/common';
-import {
-  Pool,
-  PoolConnection,
-  RowDataPacket,
-  ResultSetHeader,
-} from 'mysql2/promise';
-import CreatePuntoVentaDto from './dto/CreatePointSale.dto';
+import { HttpException, HttpStatus, Injectable, Logger } from '@nestjs/common';
+import { BaseService } from 'src/common/base.service';
 import CreateBusinessDto from './dto/CreateBusiness';
-import {
-  UpdatePuntoVentaDto,
-  UpdatePuntoVentaStatusDto,
-} from './dto/UpdatePuntoVentaDto';
+import { PoolConnection } from 'mysql2/promise';
+import { CreateBusinessWithPointsDto } from './dto/CreateBusinessWithPointsDto.dto';
+import { UpdateBusinessDto } from './dto/updateBusiness.dto';
+import { GeocodingService } from 'src/common/geocoding.service';
 
 @Injectable()
 export class BusinessService {
-  constructor(@Inject('MYSQL') private pool: Pool) {}
+  private readonly logger = new Logger(BusinessService.name);
 
-  //BUSINESS
+  constructor(
+    private readonly baseService: BaseService,
+    private readonly geocodingService: GeocodingService,
+  ) {}
 
+  // Método existente para crear negocio simple
   async create(userId: string, newBusiness: CreateBusinessDto) {
-    let connection: PoolConnection | null = null;
     try {
-      // Obtener conexión a la base de datos
-      connection = await this.pool.getConnection();
-
-      // Verificar que el usuario existe
-      const [userRows]: [any[], any] = await connection.query(
+      const userRows = await this.baseService.executeQuery(
         'SELECT id FROM users WHERE id = ?',
         [userId],
       );
@@ -37,8 +30,7 @@ export class BusinessService {
         );
       }
 
-      // Insertar el nuevo negocio
-      const [result]: [any, any] = await connection.query(
+      const result = await this.baseService.executeNonSelectQuery(
         'INSERT INTO negocios (nombre, nit, direccion, telefono, email, propietario) VALUES (?, ?, ?, ?, ?, ?)',
         [
           newBusiness.nombre,
@@ -50,31 +42,397 @@ export class BusinessService {
         ],
       );
 
-      // Obtener el negocio recién creado para devo
-      
-      const [createdBusiness] = await connection.query(
+      const createdBusiness = await this.baseService.executeQuery(
         'SELECT * FROM negocios WHERE id = ?',
         [result.insertId],
       );
 
       return createdBusiness[0];
     } catch (error) {
+      if (error instanceof HttpException) {
+        throw error;
+      }
       throw new HttpException(
         error.message || 'Error al crear el negocio',
-        error.status || HttpStatus.INTERNAL_SERVER_ERROR,
+        HttpStatus.INTERNAL_SERVER_ERROR,
       );
-    } finally {
-      if (connection) connection.release();
     }
   }
 
-  async findByUser(userId: string) {
-    let connection: PoolConnection | null = null;
+  // Método para crear negocio con puntos de venta
+  async createBusinessWithPoints(
+    userId: string,
+    businessData: CreateBusinessWithPointsDto,
+  ) {
     try {
-      connection = await this.pool.getConnection();
+      // ✅ Usar executeTransaction para manejar automáticamente la conexión
+      const result = await this.baseService.executeTransaction(
+        async (connection) => {
+          // 1. Verificar que el usuario existe
+          const [userRows]: [any[], any] = await connection.query(
+            'SELECT id FROM users WHERE id = ?',
+            [userId],
+          );
 
-      // Verificar que el usuario existe
-      const [userRows]: [any[], any] = await connection.query(
+          if (!userRows || userRows.length === 0) {
+            throw new HttpException(
+              'El usuario especificado no existe',
+              HttpStatus.BAD_REQUEST,
+            );
+          }
+
+          // 2. Verificar departamento y municipio del negocio
+          const [deptRows]: [any[], any] = await connection.query(
+            'SELECT id_departamento, departamento FROM departamentos WHERE id_departamento = ?',
+            [businessData.departamento],
+          );
+
+          if (!deptRows || deptRows.length === 0) {
+            throw new HttpException(
+              'El departamento especificado no existe',
+              HttpStatus.BAD_REQUEST,
+            );
+          }
+
+          const [muniRows]: [any[], any] = await connection.query(
+            'SELECT id_municipio, municipio FROM municipios WHERE id_municipio = ? AND departamento_id = ?',
+            [businessData.municipio, businessData.departamento],
+          );
+
+          if (!muniRows || muniRows.length === 0) {
+            throw new HttpException(
+              'El municipio especificado no existe o no pertenece al departamento',
+              HttpStatus.BAD_REQUEST,
+            );
+          }
+
+          // 🌍 3. GEOCODIFICAR LA DIRECCIÓN DEL NEGOCIO
+          this.logger.log('🌍 Geocodificando dirección del negocio...');
+
+          const businessGeocode = await this.geocodingService.getCoordinates(
+            businessData.direccion,
+            muniRows[0].municipio,
+            deptRows[0].departamento,
+          );
+
+          const businessLatitude = businessGeocode.latitude;
+          const businessLongitude = businessGeocode.longitude;
+
+          if (businessGeocode.success) {
+            this.logger.log(
+              `✅ Coordenadas del negocio: Lat ${businessLatitude}, Lon ${businessLongitude}`,
+            );
+          } else {
+            this.logger.warn(
+              '⚠️ No se pudieron obtener coordenadas del negocio',
+            );
+          }
+
+          // 4. Crear el negocio CON COORDENADAS
+          const [businessResult]: [any, any] = await connection.query(
+            `INSERT INTO negocios 
+         (nombre, nit, direccion, telefono, email, propietario, departamento, municipio, latitud, longitud) 
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+              businessData.nombre,
+              businessData.nit || null,
+              businessData.direccion,
+              businessData.telefono,
+              businessData.email,
+              userId,
+              businessData.departamento,
+              businessData.municipio,
+              businessLatitude,
+              businessLongitude,
+            ],
+          );
+
+          const businessId = businessResult.insertId;
+
+          // 5. Crear los puntos de venta CON GEOCODIFICACIÓN
+          const createdPoints: any[] = [];
+
+          if (
+            !businessData.puntosVenta ||
+            businessData.puntosVenta.length === 0
+          ) {
+            throw new HttpException(
+              'Debe incluir al menos un punto de venta',
+              HttpStatus.BAD_REQUEST,
+            );
+          }
+
+          for (let i = 0; i < businessData.puntosVenta.length; i++) {
+            const punto = businessData.puntosVenta[i];
+
+            this.logger.log(
+              `📍 Procesando punto ${i + 1}/${businessData.puntosVenta.length}: ${punto.nombre}`,
+            );
+
+            // Verificar departamento del punto
+            const [puntoDeptRows]: [any[], any] = await connection.query(
+              'SELECT id_departamento, departamento FROM departamentos WHERE id_departamento = ?',
+              [punto.departamento],
+            );
+
+            if (!puntoDeptRows || puntoDeptRows.length === 0) {
+              throw new HttpException(
+                `El departamento no existe para "${punto.nombre}"`,
+                HttpStatus.BAD_REQUEST,
+              );
+            }
+
+            // Verificar municipio del punto
+            const [puntoMuniRows]: [any[], any] = await connection.query(
+              'SELECT id_municipio, municipio FROM municipios WHERE id_municipio = ? AND departamento_id = ?',
+              [punto.municipio, punto.departamento],
+            );
+
+            if (!puntoMuniRows || puntoMuniRows.length === 0) {
+              throw new HttpException(
+                `El municipio no existe para "${punto.nombre}"`,
+                HttpStatus.BAD_REQUEST,
+              );
+            }
+
+            // 🌍 GEOCODIFICAR PUNTO DE VENTA
+            this.logger.log(`🌍 Geocodificando: ${punto.nombre}...`);
+
+            const pointGeocode = await this.geocodingService.getCoordinates(
+              punto.ubicacion,
+              puntoMuniRows[0].municipio,
+              puntoDeptRows[0].departamento,
+            );
+
+            const pointLatitude = pointGeocode.latitude;
+            const pointLongitude = pointGeocode.longitude;
+
+            if (pointGeocode.success) {
+              this.logger.log(
+                `✅ Coordenadas "${punto.nombre}": Lat ${pointLatitude}, Lon ${pointLongitude}`,
+              );
+            } else {
+              this.logger.warn(
+                `⚠️ No se pudieron obtener coordenadas de "${punto.nombre}"`,
+              );
+            }
+
+            // Insertar punto de venta CON COORDENADAS
+            const [pointResult]: [any, any] = await connection.query(
+              `INSERT INTO puntos_venta 
+           (negocio_id, nombre, ubicacion, responsable, telefono, departamento, municipio, nota, activo, latitud, longitud) 
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
+              [
+                businessId,
+                punto.nombre,
+                punto.ubicacion,
+                punto.responsable || null,
+                punto.telefono || null,
+                punto.departamento,
+                punto.municipio,
+                punto.nota || null,
+                pointLatitude,
+                pointLongitude,
+              ],
+            );
+
+            // Obtener el punto creado
+            const [createdPoint]: [any[], any] = await connection.query(
+              `SELECT 
+            pv.*,
+            d.departamento as departamento_nombre,
+            m.municipio as municipio_nombre
+           FROM puntos_venta pv
+           LEFT JOIN departamentos d ON pv.departamento = d.id_departamento
+           LEFT JOIN municipios m ON pv.municipio = m.id_municipio
+           WHERE pv.id = ?`,
+              [pointResult.insertId],
+            );
+
+            createdPoints.push(createdPoint[0]);
+
+            // ⏱️ Delay para rate limits (solo si hay más puntos)
+            if (i < businessData.puntosVenta.length - 1) {
+              this.logger.log('⏱️ Esperando 1 segundo...');
+              await new Promise((resolve) => setTimeout(resolve, 1000));
+            }
+          }
+
+          // 6. Obtener el negocio creado completo
+          const [createdBusiness]: [any[], any] = await connection.query(
+            `SELECT 
+          n.id,
+          n.nombre,
+          n.nit,
+          n.direccion,
+          n.telefono,
+          n.email,
+          n.fecha_creacion,
+          n.propietario,
+          n.created_at,
+          n.latitud,
+          n.longitud,
+          d.departamento as departamento_nombre,
+          m.municipio as municipio_nombre,
+          n.departamento as departamento_id,
+          n.municipio as municipio_id
+        FROM negocios n
+        LEFT JOIN departamentos d ON n.departamento = d.id_departamento
+        LEFT JOIN municipios m ON n.municipio = m.id_municipio
+        WHERE n.id = ?`,
+            [businessId],
+          );
+
+          // 📊 Estadísticas de geocodificación
+          const geocodedPoints = createdPoints.filter(
+            (p) => p.latitud !== null && p.longitud !== null,
+          ).length;
+
+          this.logger.log(
+            `✅ Negocio creado con ${createdPoints.length} puntos de venta`,
+          );
+          this.logger.log(
+            `📍 Geocodificación - Negocio: ${businessGeocode.success ? '✅' : '❌'} | Puntos: ${geocodedPoints}/${createdPoints.length}`,
+          );
+
+          // Retornar resultado desde el callback
+          return {
+            businessGeocode,
+            createdBusiness: createdBusiness[0],
+            createdPoints,
+            geocodedPoints,
+          };
+        },
+      );
+
+      // Construir respuesta final
+      return {
+        success: true,
+        message: 'Negocio y puntos de venta creados exitosamente',
+        business: result.createdBusiness,
+        puntosVenta: result.createdPoints,
+        totalPuntosCreados: result.createdPoints.length,
+        geocodingInfo: {
+          businessGeocodingSuccess: result.businessGeocode.success,
+          businessCoordinates: result.businessGeocode.success
+            ? {
+                latitude: result.businessGeocode.latitude,
+                longitude: result.businessGeocode.longitude,
+              }
+            : null,
+          pointsGeocoded: result.geocodedPoints,
+          totalPoints: result.createdPoints.length,
+          geocodingRate: `${result.geocodedPoints}/${result.createdPoints.length}`,
+        },
+      };
+    } catch (error) {
+      if (error instanceof HttpException) {
+        throw error;
+      }
+
+      throw new HttpException(
+        error.message || 'Error al crear el negocio con puntos de venta',
+        HttpStatus.INTERNAL_SERVER_ERROR,
+      );
+    }
+  }
+
+  // Método auxiliar para delays (agrégalo al final de la clase)
+  private delay(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  // 🆕 Método para actualizar negocio
+  async update(
+    businessId: number,
+    userId: string,
+    updateBusinessDto: UpdateBusinessDto,
+  ) {
+    try {
+      // Verificar que el negocio existe y pertenece al usuario
+      await this.baseService.verifyBusinessAccess(businessId, userId);
+
+      // Construir la consulta de actualización dinámicamente
+      const fieldsToUpdate: string[] = [];
+      const values: any[] = [];
+
+      if (updateBusinessDto.nombre !== undefined) {
+        fieldsToUpdate.push('nombre = ?');
+        values.push(updateBusinessDto.nombre);
+      }
+      if (updateBusinessDto.nit !== undefined) {
+        fieldsToUpdate.push('nit = ?');
+        values.push(updateBusinessDto.nit);
+      }
+      if (updateBusinessDto.email !== undefined) {
+        fieldsToUpdate.push('email = ?');
+        values.push(updateBusinessDto.email);
+      }
+      if (updateBusinessDto.telefono !== undefined) {
+        fieldsToUpdate.push('telefono = ?');
+        values.push(updateBusinessDto.telefono);
+      }
+      if (updateBusinessDto.direccion !== undefined) {
+        fieldsToUpdate.push('direccion = ?');
+        values.push(updateBusinessDto.direccion);
+      }
+
+      if (fieldsToUpdate.length === 0) {
+        throw new HttpException(
+          'No hay campos para actualizar',
+          HttpStatus.BAD_REQUEST,
+        );
+      }
+
+      // Agregar el ID al final de los valores
+      values.push(businessId);
+
+      const query = `UPDATE negocios SET ${fieldsToUpdate.join(', ')} WHERE id = ?`;
+
+      await this.baseService.executeNonSelectQuery(query, values);
+
+      // Obtener el negocio actualizado
+      const updatedBusiness = await this.baseService.executeQuery(
+        `SELECT 
+          n.id,
+          n.nombre,
+          n.nit,
+          n.direccion,
+          n.telefono,
+          n.email,
+          n.fecha_creacion,
+          n.created_at,
+          d.departamento as departamento_nombre,
+          m.municipio as municipio_nombre,
+          n.departamento as departamento_id,
+          n.municipio as municipio_id
+        FROM negocios n
+        LEFT JOIN departamentos d ON n.departamento = d.id_departamento
+        LEFT JOIN municipios m ON n.municipio = m.id_municipio
+        WHERE n.id = ?`,
+        [businessId],
+      );
+
+      return {
+        success: true,
+        message: 'Negocio actualizado exitosamente',
+        data: updatedBusiness[0],
+      };
+    } catch (error) {
+      if (error instanceof HttpException) {
+        throw error;
+      }
+      throw new HttpException(
+        'Error al actualizar el negocio',
+        HttpStatus.INTERNAL_SERVER_ERROR,
+      );
+    }
+  }
+
+  // Método existente para obtener negocios del usuario
+  async findByUser(userId: string) {
+    try {
+      const userRows = await this.baseService.executeQuery(
         'SELECT id FROM users WHERE id = ?',
         [userId],
       );
@@ -86,30 +444,83 @@ export class BusinessService {
         );
       }
 
-      // Obtener todos los negocios del usuario
-      const [businesses] = await connection.query(
-        'SELECT * FROM negocios WHERE propietario = ?',
+      const businesses = await this.baseService.executeQuery(
+        `SELECT 
+        n.id,
+        n.nombre,
+        n.nit,
+        n.direccion,
+        n.telefono,
+        n.email,
+        n.latitud,               -- ✅ AGREGADO
+        n.longitud,              -- ✅ AGREGADO
+        n.fecha_creacion,
+        n.propietario,
+        n.created_at,
+        d.departamento as departamento_nombre,
+        m.municipio as municipio_nombre,
+        n.departamento as departamento_id,
+        n.municipio as municipio_id
+      FROM negocios n
+      LEFT JOIN departamentos d ON n.departamento = d.id_departamento
+      LEFT JOIN municipios m ON n.municipio = m.id_municipio
+      WHERE n.propietario = ?
+      ORDER BY n.created_at DESC`,
         [userId],
       );
 
       return businesses;
     } catch (error) {
+      if (error instanceof HttpException) {
+        throw error;
+      }
       throw new HttpException(
         error.message || 'Error al obtener los negocios del usuario',
-        error.status || HttpStatus.INTERNAL_SERVER_ERROR,
+        HttpStatus.INTERNAL_SERVER_ERROR,
       );
-    } finally {
-      if (connection) connection.release();
     }
   }
 
-  async deleteBusiness(businessId: number, userId: string) {
-    let connection: PoolConnection | null = null;
+  // 🆕 Método para obtener TODOS los negocios (para el mapa)
+  async findAll() {
     try {
-      connection = await this.pool.getConnection();
+      const businesses = await this.baseService.executeQuery(
+        `SELECT 
+        n.id,
+        n.nombre,
+        n.nit,
+        n.direccion,
+        n.telefono,
+        n.email,
+        n.latitud,
+        n.longitud,
+        n.fecha_creacion,
+        n.created_at,
+        d.departamento as departamento_nombre,
+        m.municipio as municipio_nombre,
+        n.departamento as departamento_id,
+        n.municipio as municipio_id
+      FROM negocios n
+      LEFT JOIN departamentos d ON n.departamento = d.id_departamento
+      LEFT JOIN municipios m ON n.municipio = m.id_municipio
+      WHERE n.latitud IS NOT NULL AND n.longitud IS NOT NULL
+      ORDER BY n.created_at DESC`,
+      );
 
-      // Verificar que el negocio existe y pertenece al usuario
-      const [businessRows]: [any[], any] = await connection.query(
+      return businesses;
+    } catch (error) {
+      throw new HttpException(
+        error.message || 'Error al obtener todos los negocios',
+        HttpStatus.INTERNAL_SERVER_ERROR,
+      );
+    }
+  }
+
+  // Método existente para eliminar negocio
+  async deleteBusiness(businessId: number, userId: string) {
+    try {
+      // Verificar permisos ANTES de la transacción
+      const businessRows = await this.baseService.executeQuery(
         'SELECT id FROM negocios WHERE id = ? AND propietario = ?',
         [businessId, userId],
       );
@@ -121,28 +532,17 @@ export class BusinessService {
         );
       }
 
-      // Comenzar una transacción
-      await connection.beginTransaction();
-
-      try {
-        // Primero eliminar los puntos de venta asociados
+      // ✅ Usar executeTransaction
+      await this.baseService.executeTransaction(async (connection) => {
         await connection.query(
           'DELETE FROM puntos_venta WHERE negocio_id = ?',
           [businessId],
         );
 
-        // Luego eliminar el negocio
         await connection.query('DELETE FROM negocios WHERE id = ?', [
           businessId,
         ]);
-
-        // Confirmar la transacción
-        await connection.commit();
-      } catch (error) {
-        // Si hay error, revertir los cambios
-        await connection.rollback();
-        throw error;
-      }
+      });
 
       return {
         success: true,
@@ -150,449 +550,417 @@ export class BusinessService {
           'Negocio eliminado correctamente junto con todos sus puntos de venta',
       };
     } catch (error) {
+      if (error instanceof HttpException) {
+        throw error;
+      }
+
       throw new HttpException(
         error.message || 'Error al eliminar el negocio',
-        error.status || HttpStatus.INTERNAL_SERVER_ERROR,
+        HttpStatus.INTERNAL_SERVER_ERROR,
       );
-    } finally {
-      if (connection) connection.release();
     }
   }
 
-  //POINT OF SALE
-
-  async createPuntoVenta(userId: string, newPuntoVenta: CreatePuntoVentaDto) {
-
-    let connection: PoolConnection | null = null;
+  // Método para obtener un negocio con sus puntos de venta
+  // Método para obtener un negocio con sus puntos de venta
+  async getBusinessWithPoints(businessId: number, userId: string) {
     try {
-      connection = await this.pool.getConnection();
-      const [userRows]: [any[], any] = await connection.query(
-        'SELECT id FROM users WHERE id = ?',
-        [userId],
+      await this.baseService.verifyBusinessAccess(businessId, userId);
+
+      const business = await this.baseService.executeQuery(
+        `SELECT 
+        n.id,
+        n.nombre,
+        n.nit,
+        n.direccion,
+        n.telefono,
+        n.email,
+        n.latitud,               -- ✅ AGREGADO
+        n.longitud,              -- ✅ AGREGADO
+        n.fecha_creacion,
+        n.created_at,
+        d.departamento as departamento_nombre,
+        m.municipio as municipio_nombre,
+        n.departamento as departamento_id,
+        n.municipio as municipio_id
+      FROM negocios n
+      LEFT JOIN departamentos d ON n.departamento = d.id_departamento
+      LEFT JOIN municipios m ON n.municipio = m.id_municipio
+      WHERE n.id = ?`,
+        [businessId],
       );
-      if (!userRows || userRows.length === 0) {
-        throw new HttpException(
-          'El usuario especificado no existe',
-          HttpStatus.BAD_REQUEST,
-        );
+
+      if (!business || business.length === 0) {
+        throw new HttpException('Negocio no encontrado', HttpStatus.NOT_FOUND);
       }
 
-      // Verificar que el negocio existe y pertenece al usuario
-      const [businessRows]: [any[], any] = await connection.query(
-        'SELECT id FROM negocios WHERE id = ? AND propietario = ?',
-        [newPuntoVenta.negocio_id, userId],
-      );
-      if (!businessRows || businessRows.length === 0) {
-        throw new HttpException(
-          'El negocio especificado no existe o no pertenece al usuario',
-          HttpStatus.BAD_REQUEST,
-        );
-      }
-
-      // Verificar que el departamento existe
-      const [deptoRows]: [any[], any] = await connection.query(
-        'SELECT id_departamento FROM departamentos WHERE id_departamento = ?',
-        [newPuntoVenta.departamento],
-      );
-      if (!deptoRows || deptoRows.length === 0) {
-        throw new HttpException(
-          'El departamento especificado no existe',
-          HttpStatus.BAD_REQUEST,
-        );
-      }
-
-      // Verificar que el municipio existe y pertenece al departamento
-      const [muniRows]: [any[], any] = await connection.query(
-        'SELECT id_municipio FROM municipios WHERE id_municipio = ? AND departamento_id = ?',
-        [newPuntoVenta.municipio, newPuntoVenta.departamento],
-      );
-      if (!muniRows || muniRows.length === 0) {
-        throw new HttpException(
-          'El municipio especificado no existe o no pertenece al departamento indicado',
-          HttpStatus.BAD_REQUEST,
-        );
-      }
-
-      // Usar RETURNING * para obtener todos los campos de la fila insertada
-      const [result] = await connection.query(
-        'INSERT INTO puntos_venta (negocio_id, nombre, ubicacion, latitud, longitud, responsable, telefono, activo, nota, departamento, municipio) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *',
-        [
-          newPuntoVenta.negocio_id,
-          newPuntoVenta.nombre,
-          newPuntoVenta.ubicacion,
-          newPuntoVenta.latitud || null,
-          newPuntoVenta.longitud || null,
-          newPuntoVenta.responsable || null,
-          newPuntoVenta.telefono || null,
-          newPuntoVenta.activo !== undefined ? newPuntoVenta.activo : 1,
-          newPuntoVenta.nota || null,
-          newPuntoVenta.departamento,
-          newPuntoVenta.municipio,
-        ],
+      const puntosVenta = await this.baseService.executeQuery(
+        `SELECT 
+        pv.*,
+        d.departamento as departamento_nombre,
+        m.municipio as municipio_nombre
+      FROM puntos_venta pv
+      LEFT JOIN departamentos d ON pv.departamento = d.id_departamento
+      LEFT JOIN municipios m ON pv.municipio = m.id_municipio
+      WHERE pv.negocio_id = ?
+      ORDER BY pv.fecha_creacion DESC`,
+        [businessId],
       );
 
-      // El resultado ahora contiene directamente la fila insertada
-      return result[0];
-    } catch (error) {
-      throw new HttpException(
-        error.message || 'Error al crear el punto de venta',
-        error.status || HttpStatus.INTERNAL_SERVER_ERROR,
-      );
-    } finally {
-      if (connection) connection.release();
-    }
-  }
-
-  async updatePuntoVenta(
-    userId: string,
-    puntoVentaId: number,
-    updatePuntoVentaDto: UpdatePuntoVentaDto,
-  ) {
-
-    let connection: PoolConnection | null = null;
-    try {
-      connection = await this.pool.getConnection();
-
-      // Verificar que el punto de venta existe
-      const [puntoVentaRows]: [any[], any] = await connection.query(
-        'SELECT * FROM puntos_venta WHERE id = ?',
-        [puntoVentaId],
-      );
-      if (!puntoVentaRows || puntoVentaRows.length === 0) {
-        throw new HttpException(
-          'El punto de venta especificado no existe',
-          HttpStatus.NOT_FOUND,
-        );
-      }
-
-      const puntoVenta = puntoVentaRows[0];
-
-      // Verificar que el usuario existe
-      const [userRows]: [any[], any] = await connection.query(
-        'SELECT id FROM users WHERE id = ?',
-        [userId],
-      );
-      if (!userRows || userRows.length === 0) {
-        throw new HttpException(
-          'El usuario especificado no existe',
-          HttpStatus.BAD_REQUEST,
-        );
-      }
-
-      // Verificar que el negocio existe y pertenece al usuario
-      const [businessRows]: [any[], any] = await connection.query(
-        'SELECT id FROM negocios WHERE id = ? AND propietario = ?',
-        [puntoVenta.negocio_id, userId],
-      );
-      if (!businessRows || businessRows.length === 0) {
-        throw new HttpException(
-          'El negocio al que pertenece este punto de venta no existe o no pertenece al usuario',
-          HttpStatus.FORBIDDEN,
-        );
-      }
-
-      // Verificar el departamento si está siendo actualizad
-      if (updatePuntoVentaDto.departamento) {
-        const [deptoRows]: [any[], any] = await connection.query(
-          'SELECT id_departamento FROM departamentos WHERE id_departamento = ?',
-          [updatePuntoVentaDto.departamento],
-        );
-        if (!deptoRows || deptoRows.length === 0) {
-          throw new HttpException(
-            'El departamento especificado no existe',
-            HttpStatus.BAD_REQUEST,
-          );
-        }
-      }
-
-      // Verificar el municipio si está siendo actualizad
-      if (updatePuntoVentaDto.municipio) {
-        const departamentoId =
-          updatePuntoVentaDto.departamento || puntoVenta.departamento;
-        const [muniRows]: [any[], any] = await connection.query(
-          'SELECT id_municipio FROM municipios WHERE id_municipio = ? AND departamento_id = ?',
-          [updatePuntoVentaDto.municipio, departamentoId],
-        );
-        if (!muniRows || muniRows.length === 0) {
-          throw new HttpException(
-            'El municipio especificado no existe o no pertenece al departamento indicado',
-            HttpStatus.BAD_REQUEST,
-          );
-        }
-      }
-
-      // Construir la query de actualización dinámicamente
-      const updateFields: any = [];
-      const updateValues: any = [];
-
-      // Mapeo de campos a actualizar (excluyendo latitud y longitud)
-      const fieldsToUpdate = [
-        'negocio_id',
-        'nombre',
-        'ubicacion',
-        // 'latitud',  // Removidos como solicitado
-        // 'longitud', // Removidos como solicitado
-        'responsable',
-        'telefono',
-        'activo',
-        'nota',
-        'departamento',
-        'municipio',
-      ];
-
-      // Construir la lista de campos a actualizar
-      fieldsToUpdate.forEach((field) => {
-        if (updatePuntoVentaDto[field] !== undefined) {
-          updateFields.push(`${field} = ?`);
-          // Para los campos que pueden ser null
-          if (
-            field === 'responsable' ||
-            field === 'telefono' ||
-            field === 'nota'
-          ) {
-            updateValues.push(updatePuntoVentaDto[field] || null);
-          } else {
-            updateValues.push(updatePuntoVentaDto[field]);
-          }
-        }
-      });
-
-      // Añadir timestamp de actualización
-      updateFields.push('updated_at = CURRENT_TIMESTAMP');
-
-      // Si no hay campos para actualizar, retornar el punto de venta sin cambios
-      if (updateFields.length === 0) {
-        return puntoVenta;
-      }
-
-      // Añadir el ID del punto de venta a los valores
-      updateValues.push(puntoVentaId);
-
-      // Ejecutar la query de actualización
-      await connection.query(
-        `UPDATE puntos_venta SET ${updateFields.join(', ')} WHERE id = ?`,
-        updateValues,
-      );
-
-      // Fetch the updated record with a separate query
-      const [updatedRecord] = await connection.query(
-        'SELECT * FROM puntos_venta WHERE id = ?',
-        [puntoVentaId],
-      );
-
-      // Return the updated record
-      return updatedRecord[0];
-    } catch (error) {
-      throw new HttpException(
-        error.message || 'Error al actualizar el punto de venta',
-        error.status || HttpStatus.INTERNAL_SERVER_ERROR,
-      );
-    } finally {
-      if (connection) connection.release();
-    }
-  }
-
-  async updatePuntoVentaStatus(
-    userId: string,
-    puntoVentaId: number,
-    activo: UpdatePuntoVentaStatusDto,
-  ) {
-    let connection: PoolConnection | null = null;
-
-    try {
-      connection = await this.pool.getConnection();
-  
-      // Verificar que el punto de venta existe
-      const [puntoVentaRows]: [any[], any] = await connection.query(
-        'SELECT * FROM puntos_venta WHERE id = ?',
-        [puntoVentaId],
-      );
-      if (!puntoVentaRows || puntoVentaRows.length === 0) {
-        throw new HttpException(
-          'El punto de venta especificado no existe',
-          HttpStatus.NOT_FOUND,
-        );
-      }
-  
-      const puntoVenta = puntoVentaRows[0];
-  
-      // Verificar que el usuario existe
-      const [userRows]: [any[], any] = await connection.query(
-        'SELECT id FROM users WHERE id = ?',
-        [userId],
-      );
-      if (!userRows || userRows.length === 0) {
-        throw new HttpException(
-          'El usuario especificado no existe',
-          HttpStatus.BAD_REQUEST,
-        );
-      }
-  
-      // Verificar que el negocio existe y pertenece al usuario
-      const [businessRows]: [any[], any] = await connection.query(
-        'SELECT id FROM negocios WHERE id = ? AND propietario = ?',
-        [puntoVenta.negocio_id, userId],
-      );
-      if (!businessRows || businessRows.length === 0) {
-        throw new HttpException(
-          'El negocio al que pertenece este punto de venta no existe o no pertenece al usuario',
-          HttpStatus.FORBIDDEN,
-        );
-      }
-  
-      // Actualizar solo el campo 'activo' y el timestamp
-      // Convertir el booleano a tinyint (0 o 1)
-      const activoValue = activo.activo ? 1 : 0;
-      
-      await connection.query(
-        'UPDATE puntos_venta SET activo = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
-        [activoValue, puntoVentaId],
-      );
-  
-      // Obtener el registro actualizado
-      const [updatedRecord] = await connection.query(
-        'SELECT * FROM puntos_venta WHERE id = ?',
-        [puntoVentaId],
-      );
-  
-      // Convertir el campo activo a booleano para la respuesta
-      const updatedPuntoVenta = {
-        ...updatedRecord[0],
-        activo: updatedRecord[0].activo === 1, // Convertir de 0/1 a false/true
-        mensaje: `El punto de venta ha sido ${activo ? 'activado' : 'desactivado'} correctamente`,
+      return {
+        business: business[0],
+        puntosVenta: puntosVenta,
+        totalPuntos: puntosVenta.length,
       };
-      
-      return updatedPuntoVenta;
     } catch (error) {
+      if (error instanceof HttpException) {
+        throw error;
+      }
       throw new HttpException(
-        error.message || 'Error al actualizar el estado del punto de venta',
-        error.status || HttpStatus.INTERNAL_SERVER_ERROR,
+        'Error al obtener el negocio',
+        HttpStatus.INTERNAL_SERVER_ERROR,
       );
-    } finally {
-      if (connection) connection.release();
     }
   }
 
-  // Método para obtener puntos de venta de un negocio
-  async findPuntosVentaByNegocio(negocioId: number, userId: string) {
-    let connection: PoolConnection | null = null;
+  // En business.service.ts
+
+  // 🆕 Método para obtener puntos de venta de un negocio (Admin)
+  async getBusinessPointsAdmin(businessId: number) {
     try {
-      connection = await this.pool.getConnection();
-
-      // Verificar que el negocio existe y pertenece al usuario
-      const [businessRows]: [any[], any] = await connection.query(
-        'SELECT id FROM negocios WHERE id = ? AND propietario = ?',
-        [negocioId, userId],
+      // Verificar que el negocio existe
+      const business = await this.baseService.executeQuery(
+        `SELECT 
+        n.id,
+        n.nombre,
+        n.direccion,
+        n.latitud,
+        n.longitud,
+        d.departamento as departamento_nombre,
+        m.municipio as municipio_nombre
+      FROM negocios n
+      LEFT JOIN departamentos d ON n.departamento = d.id_departamento
+      LEFT JOIN municipios m ON n.municipio = m.id_municipio
+      WHERE n.id = ?`,
+        [businessId],
       );
 
-      if (!businessRows || businessRows.length === 0) {
-        throw new HttpException(
-          'El negocio no existe o no tienes permisos para acceder',
-          HttpStatus.BAD_REQUEST,
-        );
+      if (!business || business.length === 0) {
+        throw new HttpException('Negocio no encontrado', HttpStatus.NOT_FOUND);
       }
 
-      // Obtener todos los puntos de venta del negocio
-      const [puntosVenta] = await connection.query(
-        'SELECT * FROM puntos_venta WHERE negocio_id = ?',
-        [negocioId],
+      // Obtener puntos de venta con coordenadas
+      const puntosVenta = await this.baseService.executeQuery(
+        `SELECT 
+        pv.id,
+        pv.nombre,
+        pv.ubicacion,
+        pv.latitud,
+        pv.longitud,
+        pv.responsable,
+        pv.telefono,
+        pv.activo,
+        pv.nota,
+        pv.fecha_creacion,
+        d.departamento as departamento_nombre,
+        m.municipio as municipio_nombre,
+        pv.departamento as departamento_id,
+        pv.municipio as municipio_id
+      FROM puntos_venta pv
+      LEFT JOIN departamentos d ON pv.departamento = d.id_departamento
+      LEFT JOIN municipios m ON pv.municipio = m.id_municipio
+      WHERE pv.negocio_id = ? AND pv.latitud IS NOT NULL AND pv.longitud IS NOT NULL
+      ORDER BY pv.fecha_creacion DESC`,
+        [businessId],
       );
-
-      return puntosVenta;
-    } catch (error) {
-      throw new HttpException(
-        error.message || 'Error al obtener los puntos de venta',
-        error.status || HttpStatus.INTERNAL_SERVER_ERROR,
-      );
-    } finally {
-      if (connection) connection.release();
-    }
-  }
-
-  async findPuntoVentaById(
-    negocioId: number,
-    puntoVentaId: number,
-    userId: string,
-  ) {
-    let connection: PoolConnection | null = null;
-    try {
-      connection = await this.pool.getConnection();
-
-      // Verificar que el negocio existe y pertenece al usuario
-      const [businessRows]: [any[], any] = await connection.query(
-        'SELECT id FROM negocios WHERE id = ? AND propietario = ?',
-        [negocioId, userId],
-      );
-      if (!businessRows || businessRows.length === 0) {
-        throw new HttpException(
-          'El negocio no existe o no tienes permisos para acceder',
-          HttpStatus.BAD_REQUEST,
-        );
-      }
-
-      // Obtener el punto de venta específico
-      const [puntosVenta]: any = await connection.query(
-        'SELECT pv.* FROM puntos_venta pv ' +
-          'LEFT JOIN departamentos d ON pv.departamento = d.id_departamento ' +
-          'LEFT JOIN municipios m ON pv.municipio = m.id_municipio ' +
-          'WHERE pv.negocio_id = ? AND pv.id = ?',
-        [negocioId, puntoVentaId],
-      );
-
-      if (!puntosVenta || puntosVenta.length === 0) {
-        throw new HttpException(
-          'El punto de venta no existe o no pertenece al negocio especificado',
-          HttpStatus.NOT_FOUND,
-        );
-      }
-
-      return puntosVenta[0];
-    } catch (error) {
-      throw new HttpException(
-        error.message || 'Error al obtener la información del punto de venta',
-        error.status || HttpStatus.INTERNAL_SERVER_ERROR,
-      );
-    } finally {
-      if (connection) connection.release();
-    }
-  }
-
-  async deletePuntoVenta(puntoVentaId: number, userId: string) {
-    let connection: PoolConnection | null = null;
-    try {
-      connection = await this.pool.getConnection();
-
-      // Verificar que el punto de venta existe y pertenece a un negocio del usuario
-      const [puntoVentaRows]: [any[], any] = await connection.query(
-        'SELECT pv.id FROM puntos_venta pv ' +
-          'JOIN negocios n ON pv.negocio_id = n.id ' +
-          'WHERE pv.id = ? AND n.propietario = ?',
-        [puntoVentaId, userId],
-      );
-
-      if (!puntoVentaRows || puntoVentaRows.length === 0) {
-        throw new HttpException(
-          'El punto de venta no existe o no tienes permisos para eliminarlo',
-          HttpStatus.NOT_FOUND,
-        );
-      }
-
-      // Eliminar el punto de venta
-      await connection.query('DELETE FROM puntos_venta WHERE id = ?', [
-        puntoVentaId,
-      ]);
 
       return {
         success: true,
-        message: 'Punto de venta eliminado correctamente',
+        businessId: business[0].id,
+        businessName: business[0].nombre,
+        businessLocation: {
+          latitud: business[0].latitud,
+          longitud: business[0].longitud,
+          direccion: business[0].direccion,
+          departamento: business[0].departamento_nombre,
+          municipio: business[0].municipio_nombre,
+        },
+        puntosVenta: puntosVenta,
+        totalPuntos: puntosVenta.length,
       };
     } catch (error) {
+      if (error instanceof HttpException) {
+        throw error;
+      }
       throw new HttpException(
-        error.message || 'Error al eliminar el punto de venta',
-        error.status || HttpStatus.INTERNAL_SERVER_ERROR,
+        'Error al obtener los puntos de venta del negocio',
+        HttpStatus.INTERNAL_SERVER_ERROR,
       );
-    } finally {
-      if (connection) connection.release();
     }
   }
+  // En business.service.ts
+
+ // En business.service.ts
+
+async getBusinessFullDetails(businessId: number) {
+  try {
+    // 1. Obtener información del negocio
+    const business = await this.baseService.executeQuery(
+      `SELECT 
+        n.id,
+        n.nombre,
+        n.nit,
+        n.direccion,
+        n.telefono,
+        n.email,
+        n.latitud,
+        n.longitud,
+        n.fecha_creacion,
+        n.created_at,
+        d.departamento as departamento_nombre,
+        m.municipio as municipio_nombre,
+        n.departamento as departamento_id,
+        n.municipio as municipio_id,
+        n.propietario as propietario_id
+      FROM negocios n
+      LEFT JOIN departamentos d ON n.departamento = d.id_departamento
+      LEFT JOIN municipios m ON n.municipio = m.id_municipio
+      WHERE n.id = ?`,
+      [businessId],
+    );
+
+    if (!business || business.length === 0) {
+      throw new HttpException('Negocio no encontrado', HttpStatus.NOT_FOUND);
+    }
+
+    const businessData = business[0];
+
+    // 2. Obtener información del propietario
+    const propietario = await this.baseService.executeQuery(
+      `SELECT 
+        id,
+        email,
+        nombres,
+        apellidos,
+        telefono,
+        documento,
+        fecha_nacimiento,
+        role,
+        is_active,
+        created_at
+      FROM users
+      WHERE id = ?`,
+      [businessData.propietario_id],
+    );
+
+    // 3. Obtener puntos de venta
+    const puntosVenta = await this.baseService.executeQuery(
+      `SELECT 
+        pv.id,
+        pv.nombre,
+        pv.ubicacion,
+        pv.latitud,
+        pv.longitud,
+        pv.responsable,
+        pv.telefono,
+        pv.activo,
+        pv.nota,
+        pv.fecha_creacion,
+        d.departamento as departamento_nombre,
+        m.municipio as municipio_nombre
+      FROM puntos_venta pv
+      LEFT JOIN departamentos d ON pv.departamento = d.id_departamento
+      LEFT JOIN municipios m ON pv.municipio = m.id_municipio
+      WHERE pv.negocio_id = ?
+      ORDER BY pv.fecha_creacion DESC`,
+      [businessId],
+    );
+
+    // 4. Obtener catálogo de productos
+    const productos = await this.baseService.executeQuery(
+      `SELECT 
+        p.id,
+        p.nombre,
+        p.descripcion,
+        p.unidad_medida,
+        p.precio_unitario,
+        p.costo_unitario,
+        p.codigo_interno,
+        p.activo,
+        p.fecha_creacion,
+        p.updated_at,
+        (p.precio_unitario - p.costo_unitario) as margen_unitario,
+        ROUND(((p.precio_unitario - p.costo_unitario) / p.precio_unitario * 100), 2) as margen_porcentaje
+      FROM productos p
+      WHERE p.negocio_id = ?
+      ORDER BY p.fecha_creacion DESC`,
+      [businessId],
+    );
+
+    // 5. Obtener categorías de egresos con sus totales
+    const categoriasEgresos = await this.baseService.executeQuery(
+      `SELECT 
+        ce.id,
+        ce.nombre,
+        ce.descripcion,
+        ce.tipo_costo,
+        ce.activo,
+        ce.fecha_creacion,
+        COUNT(DISTINCT t.id) as total_transacciones,
+        COALESCE(SUM(CASE WHEN t.tipo = 'egreso' THEN t.monto_total ELSE 0 END), 0) as total_egresos,
+        COALESCE(
+          (SELECT ccf.monto_mensual 
+           FROM configuracion_costos_fijos ccf 
+           WHERE ccf.categoria_egreso_id = ce.id 
+           AND ccf.activo = 1 
+           LIMIT 1), 
+          0
+        ) as costo_fijo_mensual
+      FROM categorias_egresos ce
+      LEFT JOIN transacciones t ON ce.id = t.categoria_id
+      WHERE ce.negocio_id = ?
+      GROUP BY ce.id, ce.nombre, ce.descripcion, ce.tipo_costo, ce.activo, ce.fecha_creacion
+      ORDER BY ce.nombre`,
+      [businessId],
+    );
+
+    // 6. Obtener transacciones recientes (últimas 50) con detalles
+    const transacciones = await this.baseService.executeQuery(
+      `SELECT 
+        t.id,
+        t.tipo,
+        t.fecha,
+        t.monto_total,
+        t.concepto,
+        t.fecha_creacion,
+        pv.nombre as punto_venta_nombre,
+        u.nombres as usuario_nombres,
+        u.apellidos as usuario_apellidos,
+        ce.nombre as categoria_nombre,
+        COUNT(dt.id) as cantidad_items
+      FROM transacciones t
+      LEFT JOIN puntos_venta pv ON t.punto_venta_id = pv.id
+      LEFT JOIN users u ON t.usuario_id = u.id
+      LEFT JOIN categorias_egresos ce ON t.categoria_id = ce.id
+      LEFT JOIN detalle_transacciones dt ON t.id = dt.transaccion_id
+      WHERE pv.negocio_id = ?
+      GROUP BY t.id, t.tipo, t.fecha, t.monto_total, t.concepto, t.fecha_creacion,
+               pv.nombre, u.nombres, u.apellidos, ce.nombre
+      ORDER BY t.fecha DESC
+      LIMIT 50`,
+      [businessId],
+    );
+
+    // 7. Obtener costos fijos configurados
+    const costosFijos = await this.baseService.executeQuery(
+      `SELECT 
+        ccf.id,
+        ccf.monto_mensual,
+        ccf.descripcion,
+        ccf.activo,
+        ccf.fecha_creacion,
+        ce.nombre as categoria_nombre,
+        ce.tipo_costo
+      FROM configuracion_costos_fijos ccf
+      LEFT JOIN categorias_egresos ce ON ccf.categoria_egreso_id = ce.id
+      WHERE ccf.negocio_id = ?
+      ORDER BY ccf.monto_mensual DESC`,
+      [businessId],
+    );
+
+    // 8. Calcular estadísticas generales
+    const estadisticas = await this.baseService.executeQuery(
+      `SELECT 
+        COUNT(DISTINCT pv.id) as total_puntos_venta,
+        COUNT(DISTINCT p.id) as total_productos,
+        COUNT(DISTINCT ce.id) as total_categorias_egresos,
+        COUNT(DISTINCT t.id) as total_transacciones,
+        COALESCE(SUM(CASE WHEN t.tipo = 'ingreso' THEN t.monto_total ELSE 0 END), 0) as total_ingresos,
+        COALESCE(SUM(CASE WHEN t.tipo = 'egreso' THEN t.monto_total ELSE 0 END), 0) as total_egresos,
+        COALESCE(SUM(CASE WHEN t.tipo = 'ingreso' THEN t.monto_total ELSE 0 END), 0) - 
+        COALESCE(SUM(CASE WHEN t.tipo = 'egreso' THEN t.monto_total ELSE 0 END), 0) as balance_total
+      FROM negocios n
+      LEFT JOIN puntos_venta pv ON n.id = pv.negocio_id
+      LEFT JOIN productos p ON n.id = p.negocio_id
+      LEFT JOIN categorias_egresos ce ON n.id = ce.negocio_id
+      LEFT JOIN transacciones t ON pv.id = t.punto_venta_id
+      WHERE n.id = ?`,
+      [businessId],
+    );
+
+    // 9. Obtener estadísticas del mes actual
+    const estadisticasMes = await this.baseService.executeQuery(
+      `SELECT 
+        COUNT(DISTINCT t.id) as transacciones_mes,
+        COALESCE(SUM(CASE WHEN t.tipo = 'ingreso' THEN t.monto_total ELSE 0 END), 0) as ingresos_mes,
+        COALESCE(SUM(CASE WHEN t.tipo = 'egreso' THEN t.monto_total ELSE 0 END), 0) as egresos_mes,
+        COALESCE(SUM(CASE WHEN t.tipo = 'ingreso' THEN t.monto_total ELSE 0 END), 0) - 
+        COALESCE(SUM(CASE WHEN t.tipo = 'egreso' THEN t.monto_total ELSE 0 END), 0) as balance_mes
+      FROM transacciones t
+      INNER JOIN puntos_venta pv ON t.punto_venta_id = pv.id
+      WHERE pv.negocio_id = ?
+      AND MONTH(t.fecha) = MONTH(CURRENT_DATE())
+      AND YEAR(t.fecha) = YEAR(CURRENT_DATE())`,
+      [businessId],
+    );
+
+    // 10. Productos más vendidos
+    const productosMasVendidos = await this.baseService.executeQuery(
+      `SELECT 
+        p.id,
+        p.nombre,
+        p.unidad_medida,
+        p.precio_unitario,
+        COUNT(dt.id) as veces_vendido,
+        SUM(dt.cantidad) as cantidad_total_vendida,
+        SUM(dt.subtotal) as ingresos_generados
+      FROM productos p
+      INNER JOIN detalle_transacciones dt ON p.id = dt.producto_id
+      INNER JOIN transacciones t ON dt.transaccion_id = t.id
+      INNER JOIN puntos_venta pv ON t.punto_venta_id = pv.id
+      WHERE p.negocio_id = ?
+      GROUP BY p.id, p.nombre, p.unidad_medida, p.precio_unitario
+      ORDER BY cantidad_total_vendida DESC
+      LIMIT 10`,
+      [businessId],
+    );
+
+    return {
+      success: true,
+      data: {
+        negocio: businessData,
+        propietario: propietario[0] || null,
+        puntosVenta: puntosVenta,
+        productos: productos,
+        categoriasEgresos: categoriasEgresos,
+        transacciones: transacciones,
+        costosFijos: costosFijos,
+        productosMasVendidos: productosMasVendidos,
+        estadisticas: estadisticas[0] || {
+          total_puntos_venta: 0,
+          total_productos: 0,
+          total_categorias_egresos: 0,
+          total_transacciones: 0,
+          total_ingresos: 0,
+          total_egresos: 0,
+          balance_total: 0,
+        },
+        estadisticasMes: estadisticasMes[0] || {
+          transacciones_mes: 0,
+          ingresos_mes: 0,
+          egresos_mes: 0,
+          balance_mes: 0,
+        },
+      },
+    };
+  } catch (error) {
+    if (error instanceof HttpException) {
+      throw error;
+    }
+    throw new HttpException(
+      error.message || 'Error al obtener información completa del negocio',
+      HttpStatus.INTERNAL_SERVER_ERROR,
+    );
+  }
+}
 }

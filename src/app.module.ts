@@ -8,6 +8,8 @@ import { ToolsModule } from './tools/tools.module';
 import config from './config';
 import { ScheduleModule } from '@nestjs/schedule';
 import { MainModule } from './main/main.module';
+import { CommonModule } from './common/common.module';
+import { AdminModule } from './admin/admin.module';
 
 @Module({
   imports: [
@@ -21,6 +23,8 @@ import { MainModule } from './main/main.module';
     ToolsModule,
     ScheduleModule.forRoot(),
     MainModule,
+    CommonModule,
+    AdminModule,
   ],
   controllers: [AppController],
   providers: [AppService],

@@ -1,4 +1,4 @@
-import { IsNotEmpty, IsString, IsEmail, IsOptional, Length, IsNumber, IsDecimal, IsBoolean } from 'class-validator';
+import { IsNotEmpty, IsString, IsOptional, Length, IsNumber, IsDecimal, IsBoolean } from 'class-validator';
 
 export default class CreatePuntoVentaDto {
   @IsNotEmpty({ message: 'El ID del negocio es requerido' })
