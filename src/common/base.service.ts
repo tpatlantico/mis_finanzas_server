@@ -1,5 +1,5 @@
 import { HttpException, HttpStatus, Inject, Injectable } from '@nestjs/common';
-import { Pool } from 'mysql2/promise';
+import { Pool, PoolConnection } from 'mysql2/promise';
 
 @Injectable()
 export class BaseService {
@@ -22,11 +22,10 @@ export class BaseService {
 
       return rows as T[];
     } catch (error) {
-      // ✅ PRESERVAR ERRORES DE DUPLICACIÓN
       if (error.message && error.message.includes('Duplicate entry')) {
         throw new HttpException(
           `Error en la consulta: ${error.message}`,
-          HttpStatus.CONFLICT, // Cambiar a 409 para errores de duplicación
+          HttpStatus.CONFLICT,
         );
       }
 
@@ -46,11 +45,10 @@ export class BaseService {
       const [result] = await this.pool.query(query, params);
       return result;
     } catch (error) {
-      // ✅ PRESERVAR ERRORES DE DUPLICACIÓN
       if (error.message && error.message.includes('Duplicate entry')) {
         throw new HttpException(
           `Error en la consulta: ${error.message}`,
-          HttpStatus.CONFLICT, // Cambiar a 409 para errores de duplicación
+          HttpStatus.CONFLICT,
         );
       }
 
@@ -58,6 +56,28 @@ export class BaseService {
         `Error en la consulta: ${error.message}`,
         HttpStatus.INTERNAL_SERVER_ERROR,
       );
+    }
+  }
+
+  // 🆕 Método para ejecutar operaciones dentro de una transacción
+  public async executeTransaction<T>(
+    callback: (connection: PoolConnection) => Promise<T>,
+  ): Promise<T> {
+    const connection = await this.pool.getConnection();
+
+    try {
+      await connection.beginTransaction();
+      
+      const result = await callback(connection);
+      
+      await connection.commit();
+      
+      return result;
+    } catch (error) {
+      await connection.rollback();
+      throw error;
+    } finally {
+      connection.release();
     }
   }
 
@@ -89,12 +109,12 @@ export class BaseService {
     }
   }
 
-  // Método público para obtener el pool de conexiones (si necesitas acceso directo)
+  // Método público para obtener el pool de conexiones
   public getPool(): Pool {
     return this.pool;
   }
 
-  // Método público para obtener el pool de clientes (si necesitas acceso directo)
+  // Método público para obtener el pool de clientes
   public getClientPool(): Pool {
     return this.poolClient;
   }
