@@ -252,141 +252,136 @@ export class UserService {
     }
   }
 
- async delete(id: string) {
-  const pool = this.baseService.getPool();
-  let connection: PoolConnection | null = null;
-
+async delete(id: string) {
   try {
-    connection = await pool.getConnection();
-    await connection.beginTransaction();
-
-    // Verificar que el usuario existe
-    const [existingUser]: [any[], any] = await connection.query(
-      'SELECT id, email FROM users WHERE id = ?',
-      [id],
-    );
-
-    if (!existingUser || existingUser.length === 0) {
-      throw new HttpException('Usuario no encontrado', HttpStatus.NOT_FOUND);
-    }
-
-    // 1. Obtener todos los negocios del usuario
-    const [userBusinesses]: [any[], any] = await connection.query(
-      'SELECT id FROM negocios WHERE propietario = ?',
-      [id],
-    );
-
-    let totalProductosEliminados = 0;
-    let totalPuntosVentaEliminados = 0;
-    let totalTransaccionesEliminadas = 0;
-    let totalDetallesEliminados = 0;
-
-    // 2. Para cada negocio, eliminar todas sus relaciones
-    for (const business of userBusinesses) {
-      const businessId = business.id;
-
-      // Obtener todos los puntos de venta del negocio
-      const [puntosVenta]: [any[], any] = await connection.query(
-        'SELECT id FROM puntos_venta WHERE negocio_id = ?',
-        [businessId],
-      );
-
-      // Para cada punto de venta, eliminar sus transacciones y detalles
-      for (const punto of puntosVenta) {
-        const puntoVentaId = punto.id;
-
-        // Obtener transacciones del punto de venta
-        const [transacciones]: [any[], any] = await connection.query(
-          'SELECT id FROM transacciones WHERE punto_venta_id = ?',
-          [puntoVentaId],
-        );
-
-        // Eliminar detalles de cada transacción
-        for (const transaccion of transacciones) {
-          const [resultDetalles]: [any, any] = await connection.query(
-            'DELETE FROM detalle_transacciones WHERE transaccion_id = ?',
-            [transaccion.id],
-          );
-          totalDetallesEliminados += resultDetalles.affectedRows || 0;
-        }
-
-        // Eliminar transacciones del punto de venta
-        const [resultTransacciones]: [any, any] = await connection.query(
-          'DELETE FROM transacciones WHERE punto_venta_id = ?',
-          [puntoVentaId],
-        );
-        totalTransaccionesEliminadas += resultTransacciones.affectedRows || 0;
-      }
-
-      // Eliminar productos del negocio
-      const [resultProductos]: [any, any] = await connection.query(
-        'DELETE FROM productos WHERE negocio_id = ?',
-        [businessId],
-      );
-      totalProductosEliminados += resultProductos.affectedRows || 0;
-
-      // Eliminar puntos de venta del negocio
-      const [resultPuntos]: [any, any] = await connection.query(
-        'DELETE FROM puntos_venta WHERE negocio_id = ?',
-        [businessId],
-      );
-      totalPuntosVentaEliminados += resultPuntos.affectedRows || 0;
-
-      // Eliminar configuración de costos fijos y mensuales del negocio
-      await connection.query(
-        'DELETE FROM configuracion_costos_fijos WHERE negocio_id = ?',
-        [businessId],
-      );
-
-      // Eliminar histórico de costos fijos y mensuales del negocio
-      await connection.query(
-        'DELETE FROM historico_costos_fijos_mensuales WHERE negocio_id = ?',
-        [businessId],
-      );
-    }
-
-    // 3. Eliminar todos los negocios del usuario
-    await connection.query(
-      'DELETE FROM negocios WHERE propietario = ?',
-      [id],
-    );
-
-    // 4. Eliminar sesiones del usuario (si la tabla existe)
-    try {
-      await connection.query(
-        'DELETE FROM sessions WHERE user_id = ?',
+    return await this.baseService.executeTransaction(async (connection) => {
+      // Verificar que el usuario existe
+      const [existingUser]: [any[], any] = await connection.query(
+        'SELECT id, email FROM users WHERE id = ?',
         [id],
       );
-    } catch (error) {
-      // Si la tabla no existe, continuar sin problemas
-      console.log('Tabla sessions no existe o no tiene registros');
-    }
 
-    // 5. Finalmente, eliminar el usuario
-    await connection.query('DELETE FROM users WHERE id = ?', [id]);
+      if (!existingUser || existingUser.length === 0) {
+        throw new HttpException('Usuario no encontrado', HttpStatus.NOT_FOUND);
+      }
 
-    // Confirmar la transacción
-    await connection.commit();
+      // 1. Obtener todos los negocios del usuario
+      const [userBusinesses]: [any[], any] = await connection.query(
+        'SELECT id FROM negocios WHERE propietario = ?',
+        [id],
+      );
 
-    return {
-      success: true,
-      message: 'Usuario y todos sus datos relacionados eliminados exitosamente',
-      data: {
-        id: id,
-        email: existingUser[0].email,
-        negociosEliminados: userBusinesses.length,
-        productosEliminados: totalProductosEliminados,
-        puntosVentaEliminados: totalPuntosVentaEliminados,
-        transaccionesEliminadas: totalTransaccionesEliminadas,
-        detallesEliminados: totalDetallesEliminados,
-      },
-    };
+      let totalProductosEliminados = 0;
+      let totalPuntosVentaEliminados = 0;
+      let totalTransaccionesEliminadas = 0;
+      let totalDetallesEliminados = 0;
+      let totalCategoriasEgresosEliminadas = 0;
+
+      // 2. Para cada negocio, eliminar todas sus relaciones
+      for (const business of userBusinesses) {
+        const businessId = business.id;
+
+        // Obtener todos los puntos de venta del negocio
+        const [puntosVenta]: [any[], any] = await connection.query(
+          'SELECT id FROM puntos_venta WHERE negocio_id = ?',
+          [businessId],
+        );
+
+        // Para cada punto de venta, eliminar sus transacciones y detalles
+        for (const punto of puntosVenta) {
+          const puntoVentaId = punto.id;
+
+          // Obtener transacciones del punto de venta
+          const [transacciones]: [any[], any] = await connection.query(
+            'SELECT id FROM transacciones WHERE punto_venta_id = ?',
+            [puntoVentaId],
+          );
+
+          // Eliminar detalles de cada transacción
+          for (const transaccion of transacciones) {
+            const [resultDetalles]: [any, any] = await connection.query(
+              'DELETE FROM detalle_transacciones WHERE transaccion_id = ?',
+              [transaccion.id],
+            );
+            totalDetallesEliminados += resultDetalles.affectedRows || 0;
+          }
+
+          // Eliminar transacciones del punto de venta
+          const [resultTransacciones]: [any, any] = await connection.query(
+            'DELETE FROM transacciones WHERE punto_venta_id = ?',
+            [puntoVentaId],
+          );
+          totalTransaccionesEliminadas += resultTransacciones.affectedRows || 0;
+        }
+
+        // Eliminar productos del negocio
+        const [resultProductos]: [any, any] = await connection.query(
+          'DELETE FROM productos WHERE negocio_id = ?',
+          [businessId],
+        );
+        totalProductosEliminados += resultProductos.affectedRows || 0;
+
+        // Eliminar puntos de venta del negocio
+        const [resultPuntos]: [any, any] = await connection.query(
+          'DELETE FROM puntos_venta WHERE negocio_id = ?',
+          [businessId],
+        );
+        totalPuntosVentaEliminados += resultPuntos.affectedRows || 0;
+
+        // Eliminar configuración de costos fijos y mensuales del negocio
+        await connection.query(
+          'DELETE FROM configuracion_costos_fijos WHERE negocio_id = ?',
+          [businessId],
+        );
+
+        // Eliminar histórico de costos fijos y mensuales del negocio
+        await connection.query(
+          'DELETE FROM historico_costos_fijos_mensuales WHERE negocio_id = ?',
+          [businessId],
+        );
+
+        // Eliminar categorías de egresos del negocio
+        const [resultEgresos]: [any, any] = await connection.query(
+          'DELETE FROM categorias_egresos WHERE negocio_id = ?',
+          [businessId],
+        );
+        totalCategoriasEgresosEliminadas += resultEgresos.affectedRows || 0;
+      }
+
+      // 3. Eliminar todos los negocios del usuario
+      await connection.query('DELETE FROM negocios WHERE propietario = ?', [
+        id,
+      ]);
+
+      // 4. Eliminar sesiones del usuario (si la tabla existe)
+      try {
+        await connection.query('DELETE FROM sessions WHERE user_id = ?', [id]);
+      } catch (error) {
+        // Si la tabla no existe, continuar sin problemas
+        console.log('Tabla sessions no existe o no tiene registros');
+      }
+
+      // 5. Finalmente, eliminar el usuario
+      await connection.query('DELETE FROM users WHERE id = ?', [id]);
+
+      // Retornar el resultado
+      return {
+        success: true,
+        message:
+          'Usuario y todos sus datos relacionados eliminados exitosamente',
+        data: {
+          id: id,
+          email: existingUser[0].email,
+          negociosEliminados: userBusinesses.length,
+          productosEliminados: totalProductosEliminados,
+          puntosVentaEliminados: totalPuntosVentaEliminados,
+          transaccionesEliminadas: totalTransaccionesEliminadas,
+          detallesEliminados: totalDetallesEliminados,
+          categoriasEgresosEliminadas: totalCategoriasEgresosEliminadas,
+        },
+      };
+    });
   } catch (error) {
-    // Revertir la transacción en caso de error
-    if (connection) {
-      await connection.rollback();
-    }
-
     if (error instanceof HttpException) {
       throw error;
     }
@@ -395,10 +390,6 @@ export class UserService {
       error.message || 'Error al eliminar el usuario',
       HttpStatus.INTERNAL_SERVER_ERROR,
     );
-  } finally {
-    if (connection) {
-      connection.release();
-    }
   }
 }
 
