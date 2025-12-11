@@ -9,10 +9,15 @@ import {
   Patch,
   Post,
   Query,
+  Request,
+  UseGuards,
 } from '@nestjs/common';
 import { UserService } from './user.service';
 import { CreateUserDto } from './dto/CreateUserDto';
 import { UpdateUserDto } from './dto/updateUser.dto';
+import { JwtauthGuard } from 'src/auth/guards/JwtGuard.guard';
+import { ApiOperation } from '@nestjs/swagger';
+import { ChangePasswordDto } from './dto/ChangePasswordDto';
 
 @Controller('user')
 export class UserController {
@@ -58,6 +63,31 @@ export class UserController {
     } catch (error) {
       throw new HttpException(
         error.message || 'Error al registrar el usuario',
+        error.status || HttpStatus.INTERNAL_SERVER_ERROR,
+      );
+    }
+  }
+
+  @UseGuards(JwtauthGuard) // Asegúrate de importar el guard
+  @Patch(':id/change-password')
+  @ApiOperation({ summary: 'Cambiar contraseña del usuario' })
+  async changePassword(
+    @Param('id') id: string,
+    @Body() changePasswordDto: ChangePasswordDto,
+    @Request() req,
+  ) {
+    try {
+      if (req.user.sub !== id && req.user.role !== 'admin') {
+        throw new HttpException(
+          'No tienes permisos para cambiar esta contraseña',
+          HttpStatus.FORBIDDEN,
+        );
+      }
+
+      return this.userService.changePassword(id, changePasswordDto);
+    } catch (error) {
+      throw new HttpException(
+        error.message || 'Error al cambiar la contraseña',
         error.status || HttpStatus.INTERNAL_SERVER_ERROR,
       );
     }

@@ -4,6 +4,7 @@ import { CreateUserDto } from './dto/CreateUserDto';
 import { BaseService } from 'src/common/base.service';
 import { UpdateUserDto } from './dto/updateUser.dto';
 import { PoolConnection } from 'mysql2/promise';
+import { ChangePasswordDto } from './dto/ChangePasswordDto';
 
 @Injectable()
 export class UserService {
@@ -31,6 +32,81 @@ export class UserService {
       );
     }
   }
+
+  async changePassword(userId: string, changePasswordDto: ChangePasswordDto) {
+  try {
+    // Obtener el usuario con su contraseña actual
+    const users = await this.baseService.executeQuery(
+      'SELECT id, email, password FROM users WHERE id = ?',
+      [userId],
+    );
+
+    if (users.length === 0) {
+      throw new HttpException('Usuario no encontrado', HttpStatus.NOT_FOUND);
+    }
+
+    const user = users[0];
+
+    // Verificar que la contraseña actual sea correcta
+    const isPasswordValid = await bcrypt.compare(
+      changePasswordDto.currentPassword,
+      user.password,
+    );
+
+    if (!isPasswordValid) {
+      throw new HttpException(
+        'La contraseña actual es incorrecta',
+        HttpStatus.UNAUTHORIZED,
+      );
+    }
+
+    // Verificar que la nueva contraseña sea diferente a la actual
+    const isSamePassword = await bcrypt.compare(
+      changePasswordDto.newPassword,
+      user.password,
+    );
+
+    if (isSamePassword) {
+      throw new HttpException(
+        'La nueva contraseña debe ser diferente a la actual',
+        HttpStatus.BAD_REQUEST,
+      );
+    }
+
+    // Hashear la nueva contraseña
+    const hashedPassword = await bcrypt.hash(changePasswordDto.newPassword, 10);
+
+    // Actualizar la contraseña
+    await this.baseService.executeNonSelectQuery(
+      'UPDATE users SET password = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+      [hashedPassword, userId],
+    );
+
+    // Opcional: Invalidar todas las sesiones del usuario
+    try {
+      await this.baseService.executeNonSelectQuery(
+        'DELETE FROM sessions WHERE user_id = ?',
+        [userId],
+      );
+    } catch (error) {
+      console.log('No se pudieron eliminar las sesiones anteriores');
+    }
+
+    return {
+      success: true,
+      message: 'Contraseña actualizada exitosamente',
+    };
+  } catch (error) {
+    if (error instanceof HttpException) {
+      throw error;
+    }
+
+    throw new HttpException(
+      error.message || 'Error al cambiar la contraseña',
+      HttpStatus.INTERNAL_SERVER_ERROR,
+    );
+  }
+}
 
   async findById(id: string) {
     try {
